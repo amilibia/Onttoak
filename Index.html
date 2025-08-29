@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="eu">
+<head>
+  <meta charset="UTF-8">
+  <title>Onddoen Aurreikuspena (10 egun)</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 1rem; }
+    #map { height: 300px; margin: 1rem 0; }
+    #chart-container { width: 100%; max-width: 800px; margin-top: 2rem; }
+    #search-container { margin-top: 1rem; }
+    input[type="text"] { padding: 0.4rem; width: 200px; }
+    button { padding: 0.4rem; }
+  </style>
+</head>
+<body>
+  <h1>Onddoen Aurreikuspena (10 egun)</h1>
+  <div id="search-container">
+    <input type="text" id="search" placeholder="Bilatu herria (adib. Donostia)">
+    <button onclick="buscarUbicacion()">Bilatu</button>
+  </div>
+  <div id="map"></div>
+  <p><strong>Kokapena:</strong> <span id="location">Egin klik mapan edo bilatu herri bat.</span></p>
+  <div id="chart-container">
+    <canvas id="species-chart"></canvas>
+  </div>
+
+  <script>
+    const retrasos = { boletus: 3, lactarius: 2, amanita: 5, cantharellus: 7, russula: 3, macrolepiota: 4 };
+    let marker = null;
+
+    const map = L.map('map').setView([43.0, -2.6], 8);
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap'
+    }).addTo(map);
+
+    const chart = new Chart(document.getElementById('species-chart'), {
+      type: 'line',
+      data: { labels: [], datasets: [] },
+      options: {
+        responsive: true,
+        plugins: {
+          title: { display: true, text: 'Espezie bakoitzaren aurreikuspena (hurrengo 10 egunetan)' }
+        },
+        scales: {
+          y: { beginAtZero: true, max: 100, title: { display: true, text: '%' } }
+        }
+      }
+    });
+
+    function redondearCoord(valor) {
+      return Math.round(valor * 4) / 4;
+    }
+
+    async function obtenerPrediccion(lat, lon, descripcion) {
+      document.getElementById('location').innerText = descripcion;
+      if (!marker) marker = L.marker([lat, lon]).addTo(map);
+      else marker.setLatLng([lat, lon]);
+      map.setView([lat, lon], 9);
+
+      const today = new Date();
+      const start = new Date(today);
+      start.setDate(start.getDate() - 14);
+      const end = new Date(today);
+      end.setDate(end.getDate() + 10);
+      const startStr = start.toISOString().slice(0, 10);
+      const endStr = end.toISOString().slice(0, 10);
+
+      try {
+        const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,relativehumidity_2m_max&timezone=Europe%2FMadrid&start_date=${startStr}&end_date=${endStr}`;
+        const weatherResp = await fetch(url);
+        const weather = await weatherResp.json();
+
+        if (!weather.daily || !Array.isArray(weather.daily.time)) {
+          alert('Ez dago datu meteorologikorik erabilgarri.');
+          return;
+        }
+
+        const fechas = weather.daily.time;
+        const datos = {};
+        Object.keys(retrasos).forEach(esp => datos[esp] = Array(fechas.length).fill(0));
+
+        fechas.forEach((fecha, i) => {
+          const tmin = weather.daily.temperature_2m_min[i];
+          const tmax = weather.daily.temperature_2m_max[i];
+          const lluvia = weather.daily.precipitation_sum[i];
+          const humedad = weather.daily.relativehumidity_2m_max?.[i] ?? 60;
+          const favorable = (tmin >= 5 && tmax <= 25 && lluvia >= 2 && humedad >= 70);
+          Object.entries(retrasos).forEach(([esp, retraso]) => {
+            const index = i + retraso;
+            if (favorable && index < fechas.length) datos[esp][index] += 15;
+          });
+        });
+
+        chart.data.labels = fechas;
+        chart.data.datasets = Object.entries(datos).map(([esp, valores]) => ({
+          label: esp.charAt(0).toUpperCase() + esp.slice(1),
+          data: valores.map(v => Math.min(v, 100)),
+          fill: false,
+          tension: 0.3
+        }));
+
+        chart.update();
+      } catch (err) {
+        console.error('Errorea Open-Meteo APIarekin:', err);
+        alert('Errorea datu meteorologikoak eskuratzean.');
+      }
+    }
+
+    map.on('click', async e => {
+      const lat = redondearCoord(e.latlng.lat);
+      const lon = redondearCoord(e.latlng.lng);
+      const deskribapena = `Koordenatuak: ${lat}, ${lon}`;
+      obtenerPrediccion(lat, lon, deskribapena);
+    });
+
+    async function buscarUbicacion() {
+      const q = document.getElementById('search').value;
+      if (!q) return;
+      try {
+        const res = await fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=1&accept-language=eu`, {
+          headers: {
+            'User-Agent': 'Onddoen-Aurreikuspena/1.0',
+            'Referer': window.location.href
+          }
+        });
+        const datos = await res.json();
+        if (!datos.length) {
+          alert('Ez da kokapenik aurkitu.');
+          return;
+        }
+        const lat = redondearCoord(parseFloat(datos[0].lat));
+        const lon = redondearCoord(parseFloat(datos[0].lon));
+        const izena = datos[0].display_name || q;
+        obtenerPrediccion(lat, lon, izena);
+      } catch (err) {
+        console.error('Errorea bilaketan:', err);
+        alert('Errorea bilaketaren emaitzarekin.');
+      }
+    }
+  </script>
+</body>
+</html>
+
