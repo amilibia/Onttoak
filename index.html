@@ -32,6 +32,7 @@
   <script>
     // === Parametro orokorrak ===
     const retrasos = { boletus: 3, lactarius: 2, amanita: 5, cantharellus: 7, russula: 3, macrolepiota: 4 };
+    const sentikortasuna = { boletus: 1.0, lactarius: 0.9, amanita: 0.8, cantharellus: 0.95, russula: 0.85, macrolepiota: 0.9 };
 
     // === Leaflet mapa ===
     let marker = null;
@@ -49,70 +50,125 @@
       }
     });
 
-    // === Laguntza-funtzioak ===
+    // === Laguntza‑funtzioak ===
     const round025 = v => Math.round(v * 4) / 4; // 0.25ºko sareta
 
     function setMarkerAndCenter(lat, lon) {
       if (!marker) marker = L.marker([lat, lon]).addTo(map); else marker.setLatLng([lat, lon]);
-      map.setView([lat, lon], 9);
+      map.setView([lat, lon], 10, { animate: true });
     }
 
-    function updateChartWithWeather(weather) {
-      const fechas = weather.daily.time;
-      const datos = {}; Object.keys(retrasos).forEach(esp => datos[esp] = Array(fechas.length).fill(0));
+    function clamp(v, min, max){ return Math.max(min, Math.min(max, v)); }
+    function linMap(x, x1, x2, y1, y2){ if (x <= x1) return y1; if (x >= x2) return y2; return y1 + (y2 - y1) * (x - x1) / (x - x + x2 - x1); }
 
-      fechas.forEach((_, i) => {
-        const tmin = weather.daily.temperature_2m_min[i];
-        const tmax = weather.daily.temperature_2m_max[i];
-        const lluvia = weather.daily.precipitation_sum[i];
-        const humedad = weather.daily.relative_humidity_2m_max?.[i] ?? 60; // ⚠️ izen zuzena
-        const favorable = (tmin >= 5 && tmax <= 25 && lluvia >= 2 && humedad >= 70);
-        Object.entries(retrasos).forEach(([esp, retraso]) => {
-          const idx = i + retraso; if (favorable && idx < fechas.length) datos[esp][idx] += 15;
-        });
+    function mycoDailyIndex(daily){
+      // daily: {time[], temperature_2m_min[], temperature_2m_max[], precipitation_sum[], relative_humidity_2m_max[]}
+      const n = daily.time.length;
+      const base = Array(n).fill(0);
+      // euri pilaketa (3 eguneko soma)
+      const rain3 = Array(n).fill(0);
+      for (let i=0;i<n;i++){
+        const r0 = daily.precipitation_sum[i] || 0;
+        const r1 = i>0 ? (daily.precipitation_sum[i-1] || 0) : 0;
+        const r2 = i>1 ? (daily.precipitation_sum[i-2] || 0) : 0;
+        rain3[i] = r0 + r1 + r2;
+      }
+      for (let i=0;i<n;i++){
+        const tmin = daily.temperature_2m_min[i];
+        const tmax = daily.temperature_2m_max[i];
+        const tmean = (tmin + tmax)/2;
+        const hum = (daily.relative_humidity_2m_max?.[i] ?? 60);
+        const r3 = rain3[i];
+        // Tenperatura egokitasuna: gaussian 15ºC inguruan (sigma ~7)
+        const tempScore = 100 * Math.exp(-Math.pow((tmean - 15)/7, 2));
+        // Hezetasuna: 55→0, 70→60, 85→100
+        const humScore = hum <= 55 ? 0 : hum >= 85 ? 100 : ( (hum-55)/(85-55) )*100;
+        // Euria (3d soma): 0→0, 10mm→70, 20mm→100 (leundu)
+        const rainScore = r3 <= 1 ? 0 : r3 >= 20 ? 100 : (r3/20)*100;
+        const idx = 0.45*tempScore + 0.35*humScore + 0.20*rainScore; // 0–100
+        base[i] = clamp(idx, 0, 100);
+      }
+      return base;
+    }
+
+    function spreadBySpecies(base, delays, sensitivity){
+      // oinarri‑indizea (eguneko) -> espezie bakoitzerako aurreikuspena (desfasatua + leundua)
+      const n = base.length;
+      const out = {};
+      Object.keys(delays).forEach(esp => out[esp] = Array(n).fill(0));
+      Object.entries(delays).forEach(([esp, d]) => {
+        for (let i=0;i<n;i++){
+          const j = i + d;
+          if (j < n){
+            // hazkunde leuna + persistencia (egun bateko atzerapena %40)
+            const prev = j>0 ? out[esp][j-1]*0.4 : 0;
+            out[esp][j] = clamp(prev + base[i]* (sensitivity[esp]||1.0) * 0.9, 0, 100);
+          }
+        }
       });
+      return out;
+    }
 
-      chart.data.labels = fechas;
-      chart.data.datasets = Object.entries(datos).map(([esp, valores]) => ({
-        label: esp.charAt(0).toUpperCase() + esp.slice(1), data: valores.map(v => Math.min(v,100)), fill:false, tension:.3
+    function updateChart(time, speciesSeries){
+      chart.data.labels = time;
+      chart.data.datasets = Object.entries(speciesSeries).map(([esp, arr], k) => ({
+        label: esp.charAt(0).toUpperCase() + esp.slice(1),
+        data: arr.map(v => Math.round(clamp(v,0,100))),
+        fill:false,
+        borderWidth:2,
+        tension:.25
       }));
       chart.update();
     }
 
     async function fetchWeather(lat, lon) {
-      // Past egunak + hurrengo 10: Open‑Meteo forecast + past_days (CORS ez da arazoa)
+      // Past 14 + next 10, CORS‑friendly
       const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}`
                 + `&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,relative_humidity_2m_max`
                 + `&timezone=Europe%2FMadrid&past_days=14&forecast_days=10`;
       const res = await fetch(url);
-      if (!res.ok) throw new Error('Open‑Meteo  erantzun okerra: ' + res.status);
+      if (!res.ok) throw new Error('Open‑Meteo HTTP ' + res.status);
       const json = await res.json();
       if (!json.daily || !Array.isArray(json.daily.time)) throw new Error('Datu egiturarik ez');
       return json;
     }
 
     async function reverseGeocode(lat, lon) {
-      // Open‑Meteo geocoding reverse (CORS-friendly). If it fails, return coords text.
       try {
         const url = `https://geocoding-api.open-meteo.com/v1/reverse?latitude=${lat}&longitude=${lon}&language=eu&count=1`;
         const res = await fetch(url); if (!res.ok) throw new Error('Geocoding error');
         const j = await res.json();
         if (j && j.results && j.results.length) {
           const r = j.results[0];
-          return `${r.name}${r.admin1 ? ', ' + r.admin1 : ''}${r.country ? ' (' + r.country + ')' : ''}`;
+          const name = `${r.name}${r.admin1 ? ', ' + r.admin1 : ''}${r.country ? ' (' + r.country + ')' : ''}`;
+          return name;
         }
-      } catch (e) { /* silent fallback */ }
-      return `Koordenatuak: ${lat}, ${lon}`;
+      } catch (e) { /* fallback */ }
+      return null;
     }
 
     async function obtenerPrediccion(latRaw, lonRaw, labelOverride=null) {
       const lat = round025(+latRaw), lon = round025(+lonRaw);
       setMarkerAndCenter(lat, lon);
-      const label = labelOverride || await reverseGeocode(lat, lon);
-      document.getElementById('location').innerText = label;
+
+      let label = labelOverride;
+      if (!label){
+        const rev = await reverseGeocode(lat, lon);
+        label = rev || 'Ezezaguna';
+      }
+      document.getElementById('location').innerText = `${label} — (${lat.toFixed(3)}, ${lon.toFixed(3)})`;
+
       try {
         const weather = await fetchWeather(lat, lon);
-        updateChartWithWeather(weather);
+        const base = mycoDailyIndex(weather.daily);
+        const species = spreadBySpecies(base, retrasos, sentikortasuna);
+        // Azken 10 egun etorkizuneko leihoa soilik erakutsi (past_days barne baitago)
+        const time = weather.daily.time;
+        const last10IdxStart = Math.max(0, time.length - 10);
+        const time10 = time.slice(last10IdxStart);
+        const species10 = {};
+        Object.keys(species).forEach(esp => species10[esp] = species[esp].slice(last10IdxStart));
+        updateChart(time10, species10);
       } catch (err) {
         console.error(err);
         alert('Ez dago datu meteorologikorik erabilgarri puntuan. Saiatu hurbileko herri batean.');
