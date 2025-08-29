@@ -10,10 +10,14 @@
     body { font-family: Arial, sans-serif; margin: 1rem; }
     #map { height: 320px; margin: 1rem 0; }
     #chart-container { width: 100%; max-width: 900px; margin-top: 1rem; }
-    #search-container { margin-top: .5rem; display:flex; gap:.5rem; align-items:center; }
+    #search-container { margin-top: .5rem; display:flex; gap:.5rem; align-items:center; flex-wrap:wrap; }
     input[type="text"] { padding: .5rem .6rem; width: 260px; }
     button { padding: .5rem .75rem; cursor: pointer; }
     .muted { color:#666; font-size:.9rem; }
+    table { border-collapse: collapse; width:100%; max-width: 900px; margin-top:1rem; font-size:.95rem; }
+    th, td { border:1px solid #ddd; padding:.4rem .5rem; text-align:center; }
+    th { background:#f5f5f7; position: sticky; top: 0; }
+    .nowrap{ white-space:nowrap; }
   </style>
 </head>
 <body>
@@ -28,10 +32,11 @@
   <div id="chart-container">
     <canvas id="species-chart"></canvas>
   </div>
+  <div id="info"></div>
 
   <script>
     // === Parametro orokorrak ===
-    const retrasos = { boletus: 3, lactarius: 2, amanita: 5, cantharellus: 7, russula: 3, macrolepiota: 4 };
+    const retrasos = { boletus: 4, lactarius: 3, amanita: 6, cantharellus: 7, russula: 3, macrolepiota: 4 };
     const sentikortasuna = { boletus: 1.0, lactarius: 0.9, amanita: 0.8, cantharellus: 0.95, russula: 0.85, macrolepiota: 0.9 };
 
     // === Leaflet mapa ===
@@ -51,81 +56,114 @@
     });
 
     // === Laguntza‑funtzioak ===
-    const round025 = v => Math.round(v * 4) / 4; // 0.25ºko sareta
+    const round025 = v => Math.round(v * 4) / 4; // 0.25º sareta (Open‑Meteo grid) — datuetarako bakarrik
 
-    function setMarkerAndCenter(lat, lon) {
-      if (!marker) marker = L.marker([lat, lon]).addTo(map); else marker.setLatLng([lat, lon]);
-      map.setView([lat, lon], 10, { animate: true });
+    function setMarker(latRaw, lonRaw) {
+      // Erabiltzaileari klik zehatza erakusteko: markadorea KOORDENADA ZEHAZTUETAN
+      if (!marker) marker = L.marker([latRaw, lonRaw]).addTo(map); else marker.setLatLng([latRaw, lonRaw]);
     }
+    function centerZoom(lat, lon) { map.setView([lat, lon], 10, { animate: true }); }
 
     function clamp(v, min, max){ return Math.max(min, Math.min(max, v)); }
-    function linMap(x, x1, x2, y1, y2){ if (x <= x1) return y1; if (x >= x2) return y2; return y1 + (y2 - y1) * (x - x1) / (x - x + x2 - x1); }
 
-    function mycoDailyIndex(daily){
-      // daily: {time[], temperature_2m_min[], temperature_2m_max[], precipitation_sum[], relative_humidity_2m_max[]}
-      const n = daily.time.length;
+    function rollingSum(arr, w){
+      const out = Array(arr.length).fill(0);
+      let run = 0; const q = [];
+      for (let i=0;i<arr.length;i++){
+        run += (arr[i]||0); q.push(arr[i]||0);
+        if (q.length > w) run -= q.shift();
+        out[i] = run;
+      }
+      return out;
+    }
+
+    function scoreTemp(tmean){
+      // 6ºC edo gutxiago: 0 | 14–18ºC: 1 | 24ºC edo gehiago: 0 (trapezio)
+      if (tmean <= 6) return 0;
+      if (tmean >= 24) return 0;
+      if (tmean < 14) return (tmean - 6) / (14 - 6);
+      if (tmean <= 18) return 1;
+      return (24 - tmean) / (24 - 18);
+    }
+    function scoreHum(h){
+      // 55%→0, 70%→0.6, 85%→1 (lerrokatua)
+      if (h <= 55) return 0; if (h >= 85) return 1; return (h - 55) / (85 - 55);
+    }
+    function scoreRain(r7){
+      // 7 egunetako euri metatua: 0→0, 10mm→0.4, 25mm→0.8, 40mm→1; >70mm → 0.9 (gehiegi bustia)
+      if (r7 <= 0) return 0;
+      const x = r7;
+      if (x <= 10) return 0.04 * x;        // 0..0.4
+      if (x <= 25) return 0.4 + (x-10)*(0.4/15); // 0.4..0.8
+      if (x <= 40) return 0.8 + (x-25)*(0.2/15); // 0.8..1.0
+      if (x <= 70) return 1.0 - (x-40)*(0.1/30); // 1.0..0.9
+      return 0.85; // oso bustia → pixka bat jaisten da
+    }
+
+    function mycoDailyIndex(d){
+      const n = d.time.length;
+      const tmean = d.temperature_2m_min.map((v,i)=> (v + d.temperature_2m_max[i]) / 2);
+      const rain7 = rollingSum(d.precipitation_sum, 7);
       const base = Array(n).fill(0);
-      // euri pilaketa (3 eguneko soma)
-      const rain3 = Array(n).fill(0);
       for (let i=0;i<n;i++){
-        const r0 = daily.precipitation_sum[i] || 0;
-        const r1 = i>0 ? (daily.precipitation_sum[i-1] || 0) : 0;
-        const r2 = i>1 ? (daily.precipitation_sum[i-2] || 0) : 0;
-        rain3[i] = r0 + r1 + r2;
+        const sT = scoreTemp(tmean[i]);
+        const sH = scoreHum(d.relative_humidity_2m_max?.[i] ?? 60);
+        const sR = scoreRain(rain7[i]);
+        // Pisuak: hezetasun/ur baliabideak > tenperatura > euri
+        const idx = 0.45*sR + 0.35*sT + 0.20*sH; // 0–1
+        base[i] = clamp(idx*100, 0, 100);
       }
-      for (let i=0;i<n;i++){
-        const tmin = daily.temperature_2m_min[i];
-        const tmax = daily.temperature_2m_max[i];
-        const tmean = (tmin + tmax)/2;
-        const hum = (daily.relative_humidity_2m_max?.[i] ?? 60);
-        const r3 = rain3[i];
-        // Tenperatura egokitasuna: gaussian 15ºC inguruan (sigma ~7)
-        const tempScore = 100 * Math.exp(-Math.pow((tmean - 15)/7, 2));
-        // Hezetasuna: 55→0, 70→60, 85→100
-        const humScore = hum <= 55 ? 0 : hum >= 85 ? 100 : ( (hum-55)/(85-55) )*100;
-        // Euria (3d soma): 0→0, 10mm→70, 20mm→100 (leundu)
-        const rainScore = r3 <= 1 ? 0 : r3 >= 20 ? 100 : (r3/20)*100;
-        const idx = 0.45*tempScore + 0.35*humScore + 0.20*rainScore; // 0–100
-        base[i] = clamp(idx, 0, 100);
-      }
-      return base;
+      return { base, tmean, rain7 };
     }
 
     function spreadBySpecies(base, delays, sensitivity){
-      // oinarri‑indizea (eguneko) -> espezie bakoitzerako aurreikuspena (desfasatua + leundua)
       const n = base.length;
-      const out = {};
-      Object.keys(delays).forEach(esp => out[esp] = Array(n).fill(0));
+      const out = {}; Object.keys(delays).forEach(esp => out[esp] = Array(n).fill(0));
       Object.entries(delays).forEach(([esp, d]) => {
-        for (let i=0;i<n;i++){
-          const j = i + d;
-          if (j < n){
-            // hazkunde leuna + persistencia (egun bateko atzerapena %40)
-            const prev = j>0 ? out[esp][j-1]*0.4 : 0;
-            out[esp][j] = clamp(prev + base[i]* (sensitivity[esp]||1.0) * 0.9, 0, 100);
-          }
+        let prev = 0;
+        for (let j=0;j<n;j++){
+          // Oinarri‑indizea atzerapenarekin aplikatu
+          const i = j - d; // base indizea
+          const input = (i>=0) ? base[i]/100 : 0; // 0–1
+          // Exponential smoothing + decay
+          const sens = sensitivity[esp] || 1.0;
+          const grow = input * 0.7 * sens;   // eguneko ekarpena
+          const decayed = prev * 0.6;        // atzokoen herentzia
+          const p = clamp((decayed + grow)*100, 0, 100);
+          out[esp][j] = p;
+          prev = p/100;
         }
       });
       return out;
     }
 
-    function updateChart(time, speciesSeries){
-      chart.data.labels = time;
-      chart.data.datasets = Object.entries(speciesSeries).map(([esp, arr], k) => ({
-        label: esp.charAt(0).toUpperCase() + esp.slice(1),
-        data: arr.map(v => Math.round(clamp(v,0,100))),
-        fill:false,
-        borderWidth:2,
-        tension:.25
-      }));
-      chart.update();
+    function renderInfoTable(daily, extras, startIdx){
+      const { tmean, rain7 } = extras;
+      const rows = [];
+      for (let i=startIdx; i<daily.time.length; i++){
+        rows.push(`<tr>
+          <td class="nowrap">${daily.time[i]}</td>
+          <td>${(daily.temperature_2m_min[i]).toFixed(1)} / ${(daily.temperature_2m_max[i]).toFixed(1)} °C</td>
+          <td>${(daily.relative_humidity_2m_max?.[i] ?? 60).toFixed(0)}%</td>
+          <td>${(daily.precipitation_sum[i]||0).toFixed(1)} mm</td>
+          <td>${(rain7[i]||0).toFixed(1)} mm</td>
+          <td>${tmean[i].toFixed(1)} °C</td>
+        </tr>`);
+      }
+      const html = `<table>
+        <thead><tr>
+          <th>Eguna</th><th>Tmin/Tmax</th><th>Hezetasun max</th><th>Euria (egun)</th><th>Euria (7 egun)</th><th>T ertaina</th>
+        </tr></thead>
+        <tbody>${rows.join('')}</tbody>
+      </table>`;
+      document.getElementById('info').innerHTML = html;
     }
 
-    async function fetchWeather(lat, lon) {
-      // Past 14 + next 10, CORS‑friendly
-      const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}`
+    async function fetchWeather(latGrid, lonGrid) {
+      // Past 21 + next 14 (marjina zabalagoa konputurako), gero azken 10 erakusten ditugu
+      const url = `https://api.open-meteo.com/v1/forecast?latitude=${latGrid}&longitude=${lonGrid}`
                 + `&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,relative_humidity_2m_max`
-                + `&timezone=Europe%2FMadrid&past_days=14&forecast_days=10`;
+                + `&timezone=Europe%2FMadrid&past_days=21&forecast_days=14`;
       const res = await fetch(url);
       if (!res.ok) throw new Error('Open‑Meteo HTTP ' + res.status);
       const json = await res.json();
@@ -140,35 +178,37 @@
         const j = await res.json();
         if (j && j.results && j.results.length) {
           const r = j.results[0];
-          const name = `${r.name}${r.admin1 ? ', ' + r.admin1 : ''}${r.country ? ' (' + r.country + ')' : ''}`;
-          return name;
+          return `${r.name}${r.admin1 ? ', ' + r.admin1 : ''}${r.country ? ' (' + r.country + ')' : ''}`;
         }
       } catch (e) { /* fallback */ }
       return null;
     }
 
     async function obtenerPrediccion(latRaw, lonRaw, labelOverride=null) {
-      const lat = round025(+latRaw), lon = round025(+lonRaw);
-      setMarkerAndCenter(lat, lon);
+      // Markadorea: klik zehatzean
+      setMarker(latRaw, lonRaw);
+      // Datuetarako grid‑eko koordenadak
+      const latGrid = round025(+latRaw), lonGrid = round025(+lonRaw);
+      centerZoom(latRaw, lonRaw);
 
       let label = labelOverride;
       if (!label){
-        const rev = await reverseGeocode(lat, lon);
+        const rev = await reverseGeocode(latGrid, lonGrid);
         label = rev || 'Ezezaguna';
       }
-      document.getElementById('location').innerText = `${label} — (${lat.toFixed(3)}, ${lon.toFixed(3)})`;
+      document.getElementById('location').innerText = `${label} — (${(+latRaw).toFixed(4)}, ${(+lonRaw).toFixed(4)})`;
 
       try {
-        const weather = await fetchWeather(lat, lon);
-        const base = mycoDailyIndex(weather.daily);
-        const species = spreadBySpecies(base, retrasos, sentikortasuna);
-        // Azken 10 egun etorkizuneko leihoa soilik erakutsi (past_days barne baitago)
+        const weather = await fetchWeather(latGrid, lonGrid);
+        const extra = mycoDailyIndex(weather.daily);
+        const species = spreadBySpecies(extra.base, retrasos, sentikortasuna);
+        // Erakutsi azken 10 egun etorkizunekoak soilik
         const time = weather.daily.time;
-        const last10IdxStart = Math.max(0, time.length - 10);
-        const time10 = time.slice(last10IdxStart);
-        const species10 = {};
-        Object.keys(species).forEach(esp => species10[esp] = species[esp].slice(last10IdxStart));
+        const last10Start = Math.max(0, time.length - 10);
+        const time10 = time.slice(last10Start);
+        const species10 = {}; Object.keys(species).forEach(esp => species10[esp] = species[esp].slice(last10Start));
         updateChart(time10, species10);
+        renderInfoTable(weather.daily, extra, last10Start);
       } catch (err) {
         console.error(err);
         alert('Ez dago datu meteorologikorik erabilgarri puntuan. Saiatu hurbileko herri batean.');
@@ -191,7 +231,11 @@
         if (!j.results || !j.results.length) { alert('Ez da kokapena aurkitu.'); return; }
         const r = j.results[0];
         const label = `${r.name}${r.admin1 ? ', ' + r.admin1 : ''}${r.country ? ' (' + r.country + ')' : ''}`;
-        obtenerPrediccion(r.latitude, r.longitude, label);
+        // Markadorea kokapen ZEHAZEAN eta zoom
+        setMarker(r.latitude, r.longitude);
+        centerZoom(r.latitude, r.longitude);
+        // Predikzioa grid‑eko koordenadekin, baina kokapenean etiketa eta koordenatu zehatzak erakutsiz
+        await obtenerPrediccion(r.latitude, r.longitude, label);
       } catch (e) {
         console.error('Bilaketa errorea:', e);
         alert('Errorea bilaketan. Saiatu beste izen batekin (adib. Donostia/Gipuzkoa).');
